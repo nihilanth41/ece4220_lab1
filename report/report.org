@@ -1,0 +1,294 @@
+#+AUTHOR: Zachary Rump
+#+DATE: 2017-02-04
+#+TITLE: ECE 4220
+#+OPTIONS: toc:nil H:4 num:0
+#+LATEX_HEADER: \usepackage[margin=0.5in]{geometry}
+\overfullrule=2cm
+* Lab 1 Report
+** Objectives
+The objective for this lab was to become familiar with the TS-7250 boards, and
+review concepts needed to access the hardware on the board. Such as bit-masking,
+cross compilation, and syscalls like mmap() and ioremap().
+*** Lab Description
+The specific objectives of the lab were: 
+1. Write a program to wait for a button press, and play a tone on the speaker. 
+2. Write a kernel module to enable the red and yellow LEDs when loaded, and
+   disable the LEDs when unloaded. 
+** Implementation
+*** Part 1
+Part 1 of the lab asks the user which button they want to use to trigger an
+event. Because of the way the way the buttons are mapped to bits (button 0
+corresponds to portb0 and bit 0) the user input, after sanity checking, can be
+used directly to switch the necessary port to an input and check for the button
+press.
+
+The usleep() syscall is used to generate the tone.  Target duty cycle is 50%, so
+when the output value is changed the amount of time to usleep (in microseconds) for a given
+frequency F (in Hz) is:
+\begin{equation} 
+\frac{T}{2} = \frac{F_s*10^6}{2}
+\end{equation}
+*** Part 2
+The main thing worth noting about the part 2 implementation is that it involved
+building the program as a kernel module instead of a userspace program.  This
+means that the built program is left as object code (as opposed to an
+executable) and loaded\slash unloaded with modprobe or insmod and rmmod.
+Another consequence is that the program uses kernel print (printk) which prints
+to the kernel message buffer (viewable with `dmesg`).
+*** Flowcharts
+
+[[./images/flowchart_pt1.png]]
+
+Figure 1. Shows the flowchart for the first part of Lab 1.
+
+[[./images/flowchart_pt2.png]]
+
+Figure 2. Shows the flowchart for the second part of Lab 1.
+** Experiments and Results
+*** Part 1 
+The first part of the lab assignment was tested mostly by making sure the user
+input parameters were valid. For example, making sure the mmap() call was
+successful, checking if the button specified is between 0 and 4, and testing to
+make sure that the program only responds to the specified button. I.e. pressing
+button 4 does nothing if button 1 was specified.
+
+*** Part 2 
+The second part of the lab was tested by continuously loading/reloading the
+kernel module and ensuring that the LEDs would turn on and off (respectively).
+Additionally, since printk prints to the kernel message buffer, it was helpful
+to use a command like 
+#+BEGIN_SRC 
+dmesg | tail -n 10
+#+END_SRC
+in order to watch the kernel message buffer and make sure the module was actually being
+loaded and unloaded.
+
+** Discussion
+This lab was pretty straightforward for the most part. 
+The code for part one is adapted from my ECE3220 Lab 10 solution. 
+Did not have much trouble with the first part, except that the speaker did not
+sound that great. This is probably because of using usleep() instead of a
+method with more precise timing. 
+
+The main hangup encountered in part two was messing up the binary shift by one
+unit a few times.
+*** Post Lab Questions:
+**** 1 
+Assuming that PortB has 8 I/O lines associated with it, what value would you 
+assign to Port B’s data direction register so that the I/O lines associated with
+bits 0, 3 and 7 are inputs, and the rest are outputs?
+
+#+BEGIN_SRC 
+// input => DDR bit is 0
+// output => DDR bit is 1
+*PBDDR |=  0x76; // b01110110
+#+END_SRC
+
+**** 2 
+Assuming that PortB has 8 I/O lines which are all configured as outputs, what would you
+write to Port B’s data register so that bits 2, 4, and 5 are set to one, bits 1, 3, and 6 are set
+to 0 and bits 7 and 0 retain their original value?
+
+#+BEGIN_SRC 
+*PBDR |= 0x34;    // b00110100;
+*PBDR &= ~(0x4A); // ~(b01001010)
+#+END_SRC
+
+**** 3 
+Imagine that in the user-space program (Part-1) you want to terminate the sound
+by pressing a key on the keyboard. How could you do that?  Are there any
+implementation difficulties? (You don’t have to implement it).
+ 
+#+BEGIN_SRC 
+One way to do this is with something like _kbhit() on Windows.  
+Or see www.flipcode.com/archives/_kbhit_for_Linux.shtml
+Another option is to use fork() or pthreads to create a new process/thread, and
+check for button press in that process.
+#+END_SRC
+**** 4 
+How do you think you could solve the frequency issues to get a “nice”,
+consistent sound the in the speaker?
+
+#+BEGIN_SRC 
+usleep() is not concerned much with the accuracy of how long the sleep happens. 
+Probably the best way to do this would be to use a system timer interrupt. 
+It could be done more accurately, but less efficiently, using for or while loops.
+I.e. a "busy wait."
+#+END_SRC
+
+** Code  
+*** Part 1
+#+NAME: Part 1
+#+ATTR_LATEX: :foat nil
+#+BEGIN_SRC C
+/* ECE3220 Lab 10 template
+ * Author: Luis Rivera
+ * 
+ * This program shows how to map the ports of the TS7250 board so they can be used
+ * in an application (User Space). */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+int main(int argc, char **argv){
+	int fd;		// for the file descriptor of the special file we need to open.
+	unsigned long *BasePtr;		// base pointer, for the beginning of the memory page (mmap)
+	unsigned long *PBDR, *PBDDR;	// pointers for port B DR/DDR
+	unsigned long *PFDR, *PFDDR;	// pointers for port F DR/DDR
+	int input, i;
+	
+	printf("Enter a number (0-4): ");
+	scanf(" %d", &input);
+	if(input < 0 || input > 4) 
+	{
+		printf("ERROR: Enter a number between 0 and 4\n");
+		return EXIT_FAILURE;
+	}
+
+	fd = open("/dev/mem", O_RDWR|O_SYNC);	// open the special file /dem/mem
+	if(fd == -1){
+		printf("Error opening /dev/mem. Are you root?\n");
+		return(-1);  // failed open
+	}
+
+	// We need to map Address 0x80840000 (beginning of the page)
+	BasePtr = (unsigned long*)mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0x80840000);
+	if(BasePtr == MAP_FAILED){
+		printf("\n Unable to map memory space \n");
+		return(-2);
+	}  // failed mmap
+
+	// To access other registers in the page, we need to offset the base pointer to reach the
+	// corresponding addresses. Those can be found in the board's manual.
+	PBDR = BasePtr + 1;	// Address of port B DR is 0x80840004
+	PBDDR = BasePtr + 5;	// Address of port B DDR is 0x80840014
+	
+	PFDR = BasePtr + 12; 
+	PFDDR = BasePtr + 13;
+
+	// Set user-specified pushButton as input (b == 0)
+	*PBDDR &= ~(1 << input);
+	printf("Waiting for button %d to be pressed...\n", input);
+	do {
+		// Read pushbutton
+		int button_status = (*PBDR & (1 << input));
+		if(button_status == 0) 
+		{
+			printf("Button %d pressed!\n", input);
+			fflush(stdout);
+			// Play sound
+			// Set F1 as output (b == 1)
+			*PFDDR |= 0x02;
+			// Set F1 as HIGH
+			for(i=0; i<20; i++)
+			{
+				// 2kHZ 
+				// 1/2000 = 500uS
+				usleep(100);
+				*PFDR  |= 0x02;
+				usleep(100);
+				*PFDR &= ~(0x02);
+			}
+			// Set as input
+			*PFDDR &= ~(0x02);
+			usleep(500);
+			break;
+		}
+
+	} while(1);
+	
+	close(fd);	// close the special file
+
+	return 0;
+}
+#+END_SRC
+*** Part 2
+#+NAME: Part 2
+#+ATTR_LATEX: :foat nil
+#+BEGIN_SRC C
+#ifndef MODULE 
+#define MODULE
+#endif
+
+#ifndef __KERNEL__
+#define __KERNEL__
+#endif
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+
+MODULE_LICENSE("GPL");
+
+int init_module(void) {
+	unsigned long *BasePtr;		// base pointer, for the beginning of the memory page (mmap)
+	unsigned long *PBDR, *PBDDR;	// pointers for port B DR/DDR
+	
+	// Attempt to map file descriptor
+	BasePtr = (unsigned long *) __ioremap(0x80840000, 4096, 0);
+	if(NULL == BasePtr) 
+	{
+		printk(KERN_INFO "Unable to map memory space\n");
+		return -1;
+	}
+	
+	// Configure PORTB registers
+	PBDR = BasePtr + 1;
+	PBDDR = BasePtr + 5;
+
+	// Red/B5 output	
+	*PBDDR |= 0x20;
+	// Yellow/B6 output
+	*PBDDR |= 0x40;
+	// Green/B7 output
+	*PBDDR |= 0x80;
+	
+	// Red on
+	*PBDR |= 0x20;
+	// Yellow on
+	*PBDR |= 0x40;
+	// Green off
+	*PBDR &= ~(0x80);
+
+	printk(KERN_INFO "MODULE INSTALLED\n");
+	return 0;
+}
+
+void cleanup_module(void)
+{
+	unsigned long *BasePtr;		// base pointer, for the beginning of the memory page (mmap)
+	unsigned long *PBDR, *PBDDR;	// pointers for port B DR/DDR
+	
+	// Attempt to map file descriptor
+	BasePtr = (unsigned long *) __ioremap(0x80840000, 4096, 0);
+	if(NULL == BasePtr) 
+	{
+		printk(KERN_INFO "Unable to map memory space\n");
+		return;
+	}
+	// Configure PORTB registers
+	PBDR = BasePtr + 1;
+	PBDDR = BasePtr + 5;
+
+	// Red/B5 output	
+	*PBDDR |= 0x20;
+	// Yellow/B6 output
+	*PBDDR |= 0x40;
+	// Green/B7 output
+	*PBDDR |= 0x80;
+	
+	// Red off
+	*PBDR &= ~(0x20);
+	// Yellow on
+	*PBDR &= ~(0x40);
+	// Green off
+	*PBDR &= ~(0x80);
+	
+	printk(KERN_INFO "MODULE REMOVED\n");
+	return;
+}
+#+END_SRC
